@@ -24,7 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-		'brick_detector_node = brick_detection.brick_detector_node:main',
+		# 'brick_detector_node = brick_detection.brick_detector_node:main',
 		'yolo_detector = brick_detection.yolo_detector_node:main',
         ],
     },
