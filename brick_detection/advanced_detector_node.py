@@ -25,7 +25,7 @@ class YoloV8Detector(Node):
         # --- Parameters ---
         default_model_path = os.path.join(
             os.path.expanduser('~'),
-            'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'last.pt'
+            'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'best_final.pt'
         )
         self.declare_parameter('model_path', default_model_path)
         # self.declare_parameter('image_topic', '/environment_camera/image_raw')
@@ -48,11 +48,12 @@ class YoloV8Detector(Node):
 
         self.bridge = CvBridge()
         
+        self.last_bricks_detected = BricksArray()
         # --- Publishers / Subscribers ---
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
         self.image_pub = self.create_publisher(Image, '/yolo/annotated_image', 10)
         self.dets_pub = self.create_publisher(Detection2DArray, '/yolo/detections', 10)
-        self.bricks_pub = self.create_publisher(BricksArray, '/bricks_detected', 10)
+        self.bricks_pub = self.create_publisher(BricksArray, '/detected_bricks', 10)
 
     def get_orientation_pca(self, contour_points):
         if len(contour_points) < 3: 
@@ -93,14 +94,14 @@ class YoloV8Detector(Node):
         
         # --- REGION DEFINITION (Horizontal Split) ---
         # Split line at 40% of HEIGHT
-        split_y = int(0.40 * H)
+        split_y = int(0.42 * H)
         
         # Grid Area: 30x30cm square
         # Center: X = Middle of image, Y = On the split line
         grid_size_cm = 24.0
         grid_size_px = int(grid_size_cm * self.px_per_cm)
         
-        grid_center_x = int(W / 2)
+        grid_center_x = int((W / 2) + 56) 
         grid_center_y = split_y  # Centered on the dividing line
         
         grid_x1 = int(grid_center_x - grid_size_px / 2)
@@ -252,6 +253,7 @@ class YoloV8Detector(Node):
 
         # 7. Publish
         self.dets_pub.publish(dets_msg)
+        self.last_bricks_detected = bricks_msg
         self.bricks_pub.publish(bricks_msg)
         
         out_img_msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding='bgr8')
