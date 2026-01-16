@@ -40,8 +40,10 @@ class YoloV8Detector(Node):
             'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'best_final.pt'
         )
         self.declare_parameter('model_path', default_model_path)
-        self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
+        # self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
+        self.declare_parameter('image_topic', '/environment_camera/image_raw')
         self.declare_parameter('pixels_per_cm', 8.0) 
+
 
         model_path = self.get_parameter('model_path').value
         image_topic = self.get_parameter('image_topic').value

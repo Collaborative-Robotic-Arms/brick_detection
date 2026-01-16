@@ -27,6 +27,7 @@ setup(
 		# 'brick_detector_node = brick_detection.brick_detector_node:main',
 		'yolo_detector = brick_detection.yolo_detector_node:main',
         'advanced_yolo = brick_detection.advanced_detector_node:main',
+        'simulation_detector = brick_detection.simulation_detector_node:main',
         ],
     },
 )
