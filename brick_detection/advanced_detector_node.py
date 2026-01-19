@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 import cv2
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 from geometry_msgs.msg import Quaternion, Pose
@@ -18,12 +18,9 @@ from brick_detection.brick_tracker import BrickTracker
 # ==========================================
 #  NEW: Import the Service Definition
 # ==========================================
-# Ensure this matches your package structure. 
-# Based on your prompt, the service is likely in 'supervisor_package' or 'dual_arms_msgs'
 try:
     from dual_arms_msgs.srv import DetectBricks
 except ImportError:
-    # Fallback if the package name is different in your workspace
     from dual_arms_msgs.srv import DetectBricks
 
 
@@ -40,14 +37,18 @@ class YoloV8Detector(Node):
             'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'best_final.pt'
         )
         self.declare_parameter('model_path', default_model_path)
-        # self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('image_topic', '/environment_camera/image_raw')
         self.declare_parameter('pixels_per_cm', 8.0) 
-
+        
+        # New parameters for coordinate conversion logic
+        self.declare_parameter('camera_info_topic', '/environment_camera/camera_info')
+        self.declare_parameter('static_z_height', 0.5) # Default height in meters
 
         model_path = self.get_parameter('model_path').value
         image_topic = self.get_parameter('image_topic').value
         self.px_per_cm = self.get_parameter('pixels_per_cm').value
+        self.static_z = self.get_parameter('static_z_height').value
+        cam_info_topic = self.get_parameter('camera_info_topic').value
 
         self.get_logger().info(f"Loading YOLO model from: {model_path}")
         self.model = YOLO(model_path)
@@ -60,8 +61,13 @@ class YoloV8Detector(Node):
         # Initialize storage for the last detected bricks
         self.last_bricks_detected = BricksArray()
         
+        # Buffers for camera intrinsics
+        self.intrinsics = None 
+
         # --- Publishers / Subscribers ---
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
+        self.info_sub = self.create_subscription(CameraInfo, cam_info_topic, self.info_callback, 10)
+        
         self.image_pub = self.create_publisher(Image, '/yolo/annotated_image', 10)
         self.dets_pub = self.create_publisher(Detection2DArray, '/yolo/detections', 10)
         self.bricks_pub = self.create_publisher(BricksArray, '/detected_bricks', 10)
@@ -74,55 +80,35 @@ class YoloV8Detector(Node):
         )
         self.get_logger().info("Service 'detect_bricks' is ready.")
 
-    # ==========================================
-    #  NEW: Service Callback Logic
-    # ==========================================
-    def detect_bricks_callback(self, request, response):
-        """
-        Handles requests to the 'detect_bricks' service.
-        Returns the cached values from self.last_bricks_detected.
-        """
-        self.get_logger().info(f"Service Request Received. Looking for type: '{request.brick_type}'")
+    def info_callback(self, msg):
+        """Stores the camera intrinsic matrix parameters."""
+        # K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+        self.intrinsics = {
+            'fx': msg.k[0], 'fy': msg.k[4],
+            'cx': msg.k[2], 'cy': msg.k[5]
+        }
 
-        # 1. Filter logic
-        # Convert request string to Upper Case for comparison (e.g., "L_brick" -> "L_BRICK")
+    def detect_bricks_callback(self, request, response):
+        self.get_logger().info(f"Service Request Received. Looking for type: '{request.brick_type}'")
         req_type_str = request.brick_type.upper() if request.brick_type else "ALL"
-        
         matched_bricks = []
 
-        # Access the latest detection data
         if self.last_bricks_detected and self.last_bricks_detected.bricks:
             for b in self.last_bricks_detected.bricks:
-                
-                # Check if we should return ALL bricks or filter by type
                 if req_type_str == "ALL" or req_type_str == "":
                     matched_bricks.append(b)
                 else:
-                    # Convert the requested string to the Integer ID used in the message
                     target_id = self.get_brick_type_id(req_type_str)
-                    
-                    # If IDs match, add to list
                     if b.type == target_id:
                         matched_bricks.append(b)
 
-        # 2. Populate Response
-        # Note: If 'supervisor_package/Brick' is different from 'dual_arms_msgs/Brick',
-        # you may need to manually copy fields (e.g., new_b.id = b.id).
-        # Here we assume they are compatible.
         response.bricks = matched_bricks
-
         if matched_bricks:
             response.success = True
-            # Since detection returns a list, we pick the first one as the primary "handover_pose"
-            # or you can leave it empty if your logic handles the list directly.
-            # response.handover_pose = matched_bricks[0].pose
         else:
             response.success = False
-            response.handover_pose = Pose() # Return empty pose on failure
-
+            response.handover_pose = Pose()
         return response
-
-    # ... (Rest of your existing methods remain unchanged) ...
 
     def get_orientation_pca(self, contour_points):
         if len(contour_points) < 3: 
@@ -147,7 +133,7 @@ class YoloV8Detector(Node):
         if 'L' in cn: return Brick.L_BRICK
         if 'T' in cn: return Brick.T_BRICK
         if 'Z' in cn: return Brick.Z_BRICK
-        return 255 # Unknown
+        return 255 
 
     def image_callback(self, msg: Image):
         try:
@@ -175,7 +161,6 @@ class YoloV8Detector(Node):
 
         if results.boxes is not None:
             has_masks = results.masks is not None
-            
             for i, box in enumerate(results.boxes):
                 x1, y1, x2, y2 = map(float, box.xyxy[0].cpu().numpy())
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -238,11 +223,19 @@ class YoloV8Detector(Node):
             brick.type = self.get_brick_type_id(name)
             brick.side = assigned_side
             
-            brick.pose.position.x = float(cx - W/2) 
-            brick.pose.position.y = float(cy - H/2)
-            brick.pose.position.z = 0.0
+            # --- DYNAMIC COORDINATE CONVERSION WITH STATIC Z ---
+            if self.intrinsics is not None:
+                # Calculate X and Y using Pinhole Camera Model and static height
+                brick.pose.position.x = (cx - self.intrinsics['cx']) * self.static_z / self.intrinsics['fx']
+                brick.pose.position.y = (cy - self.intrinsics['cy']) * self.static_z / self.intrinsics['fy']
+                brick.pose.position.z = float(self.static_z)
+            else:
+                # Fallback to original pixel-offset logic if intrinsics are missing
+                brick.pose.position.x = float(cx - W/2) 
+                brick.pose.position.y = float(cy - H/2)
+                brick.pose.position.z = 0.0
+
             brick.pose.orientation = self.get_quaternion_from_yaw(angle_rad)
-            
             bricks_msg.bricks.append(brick)
 
             ros_det = Detection2D()
@@ -276,9 +269,7 @@ class YoloV8Detector(Node):
             cv2.line(annotated_frame, (int(cx), int(cy)), (end_x, end_y), (0, 0, 255), 3)
 
         overlay = annotated_frame.copy()
-        
         cv2.line(overlay, (0, split_y), (W, split_y), (255, 255, 255), 2)
-        
         cv2.putText(overlay, "ABB Side", (10, split_y - 10), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(overlay, "AR4 Side", (10, split_y + 30), 
@@ -291,7 +282,6 @@ class YoloV8Detector(Node):
         cv2.addWeighted(overlay, 0.3, annotated_frame, 0.7, 0, annotated_frame)
 
         self.dets_pub.publish(dets_msg)
-        # Update the variable accessed by the service
         self.last_bricks_detected = bricks_msg
         self.bricks_pub.publish(bricks_msg)
         
