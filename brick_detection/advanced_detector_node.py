@@ -15,6 +15,8 @@ from ultralytics import YOLO
 from dual_arms_msgs.msg import BricksArray, Brick
 from brick_detection.brick_tracker import BrickTracker
 
+
+from visualization_msgs.msg import Marker, MarkerArray
 # ==========================================
 #  NEW: Import the Service Definition
 # ==========================================
@@ -27,6 +29,8 @@ except ImportError:
 # ==========================================
 #  The Main ROS Node
 # ==========================================
+# ... (existing imports)
+
 class YoloV8Detector(Node):
     def __init__(self):
         super().__init__('yolov8_detector')
@@ -37,18 +41,57 @@ class YoloV8Detector(Node):
             'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'best_final.pt'
         )
         self.declare_parameter('model_path', default_model_path)
-        self.declare_parameter('image_topic', '/environment_camera/image_raw')
+        self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('pixels_per_cm', 8.0) 
         
         # New parameters for coordinate conversion logic
-        self.declare_parameter('camera_info_topic', '/environment_camera/camera_info')
-        self.declare_parameter('static_z_height', 0.5) # Default height in meters
+        # self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
+        self.declare_parameter('static_z_height', 0.712) # Default height in meters
+        self.declare_parameter('camera_frame', 'camera_color_optical_frame')
 
         model_path = self.get_parameter('model_path').value
         image_topic = self.get_parameter('image_topic').value
         self.px_per_cm = self.get_parameter('pixels_per_cm').value
         self.static_z = self.get_parameter('static_z_height').value
-        cam_info_topic = self.get_parameter('camera_info_topic').value
+        # cam_info_topic = self.get_parameter('camera_info_topic').value
+        self.camera_frame = self.get_parameter('camera_frame').value
+
+        # --- Hardcoded Calibration Data ---
+        # Camera Matrix (K)
+        self.k_matrix = np.array([
+            [607.6493463464219, 0.0, 330.2045740645484],
+            [0.0, 605.19606629627, 246.36866587909964],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+
+        # Distortion Coefficients (D)
+        self.dist_coeffs = np.array([
+            0.030701467019085278, 0.6603616986413218, 
+            -0.0030859808687108714, -0.005391372766986892, 
+            -2.547370818352119
+        ], dtype=np.float64)
+
+    
+
+        # Optimization: Pre-compute the Map
+        # Assuming standard RealSense 640x480. If you use 1280x720, change these.
+        self.img_w, self.img_h = 640, 480 
+        
+        # Alpha=0 crops the image to remove black edges created by undistortion
+        new_camera_mtx, roi = cv2.getOptimalNewCameraMatrix(
+            self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0, (self.img_w, self.img_h)
+        )
+        
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            self.k_matrix, self.dist_coeffs, None, new_camera_mtx, 
+            (self.img_w, self.img_h), cv2.CV_32FC1
+        )
+
+        # Update intrinsics for the coordinate math to use the NEW camera matrix
+        self.intrinsics = {
+            'fx': new_camera_mtx[0, 0], 'fy': new_camera_mtx[1, 1],
+            'cx': new_camera_mtx[0, 2], 'cy': new_camera_mtx[1, 2]
+        }
 
         self.get_logger().info(f"Loading YOLO model from: {model_path}")
         self.model = YOLO(model_path)
@@ -61,16 +104,22 @@ class YoloV8Detector(Node):
         # Initialize storage for the last detected bricks
         self.last_bricks_detected = BricksArray()
         
-        # Buffers for camera intrinsics
-        self.intrinsics = None 
-
+        
         # --- Publishers / Subscribers ---
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
-        self.info_sub = self.create_subscription(CameraInfo, cam_info_topic, self.info_callback, 10)
+        # self.info_sub = self.create_subscription(CameraInfo, cam_info_topic, self.info_callback, 10)
         
         self.image_pub = self.create_publisher(Image, '/yolo/annotated_image', 10)
         self.dets_pub = self.create_publisher(Detection2DArray, '/yolo/detections', 10)
         self.bricks_pub = self.create_publisher(BricksArray, '/detected_bricks', 10)
+
+
+        # NEW: MarkerArray publisher
+        self.marker_pub = self.create_publisher(
+            MarkerArray,
+            '/yolo/markers',
+            10
+        )
 
         # ==========================================
         self.srv = self.create_service(
@@ -80,13 +129,30 @@ class YoloV8Detector(Node):
         )
         self.get_logger().info("Service 'detect_bricks' is ready.")
 
-    def info_callback(self, msg):
-        """Stores the camera intrinsic matrix parameters."""
-        # K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-        self.intrinsics = {
-            'fx': msg.k[0], 'fy': msg.k[4],
-            'cx': msg.k[2], 'cy': msg.k[5]
-        }
+    # def info_callback(self, msg):
+    #     """Stores the camera intrinsic matrix and distortion coefficients."""
+    #     # K matrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+    #     self.intrinsics = {
+    #         'fx': msg.k[0], 'fy': msg.k[4],
+    #         'cx': msg.k[2], 'cy': msg.k[5],
+    #         'k_matrix': np.array(msg.k).reshape(3, 3)
+    #     }
+    #     self.distortion_coeffs = np.array(msg.d)
+        
+    #     # Pre-compute rectification maps to save CPU (only once)
+    #     if self.map1 is None:
+    #         w, h = msg.width, msg.height
+    #         # getOptimalNewCameraMatrix can be used here if you want to crop/scale, 
+    #         # but for RealSense, the raw K is usually fine for rectification.
+    #         self.map1, self.map2 = cv2.initUndistortRectifyMap(
+    #             self.intrinsics['k_matrix'], 
+    #             self.distortion_coeffs, 
+    #             None, 
+    #             self.intrinsics['k_matrix'], 
+    #             (w, h), 
+    #             cv2.CV_32FC1
+    #         )
+    #         self.get_logger().info("Camera rectification maps computed.")
 
     def detect_bricks_callback(self, request, response):
         self.get_logger().info(f"Service Request Received. Looking for type: '{request.brick_type}'")
@@ -137,10 +203,29 @@ class YoloV8Detector(Node):
 
     def image_callback(self, msg: Image):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            raw_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f"CV bridge error: {e}")
             return
+
+        # Check if resolution changed, if so, recompute maps (safety check)
+        h, w = raw_frame.shape[:2]
+        if w != self.img_w or h != self.img_h:
+            self.get_logger().warn("Resolution mismatch! Recomputing maps...")
+            self.img_w, self.img_h = w, h
+            new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(
+                self.k_matrix, self.dist_coeffs, (w, h), 0, (w, h)
+            )
+            self.map1, self.map2 = cv2.initUndistortRectifyMap(
+                self.k_matrix, self.dist_coeffs, None, new_camera_mtx, (w, h), cv2.CV_32FC1
+            )
+            self.intrinsics.update({
+                'fx': new_camera_mtx[0, 0], 'fy': new_camera_mtx[1, 1],
+                'cx': new_camera_mtx[0, 2], 'cy': new_camera_mtx[1, 2]
+            })
+
+        # Apply the undistortion
+        frame = cv2.remap(raw_frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
 
         H, W, _ = frame.shape
         split_y = int(0.42 * H)
@@ -158,6 +243,8 @@ class YoloV8Detector(Node):
 
         results = self.model(frame, verbose=False, retina_masks=True)[0]
         current_frame_data = []
+
+        msg.header.frame_id = self.camera_frame
 
         if results.boxes is not None:
             has_masks = results.masks is not None
@@ -190,6 +277,7 @@ class YoloV8Detector(Node):
         bricks_msg = BricksArray()
         bricks_msg.header = msg.header
 
+        marker_array = MarkerArray()
         annotated_frame = frame.copy()
 
         for det in tracked_detections:
@@ -229,14 +317,37 @@ class YoloV8Detector(Node):
                 brick.pose.position.x = (cx - self.intrinsics['cx']) * self.static_z / self.intrinsics['fx']
                 brick.pose.position.y = (cy - self.intrinsics['cy']) * self.static_z / self.intrinsics['fy']
                 brick.pose.position.z = float(self.static_z)
+
+                brick.pose.position.x = brick.pose.position.x - 0.0546
+                brick.pose.position.y = brick.pose.position.y + 0.674
+                brick.pose.position.z = 0.769-brick.pose.position.z
             else:
                 # Fallback to original pixel-offset logic if intrinsics are missing
-                brick.pose.position.x = float(cx - W/2) 
+                brick.pose.position.x = float(cx - W/2)
                 brick.pose.position.y = float(cy - H/2)
                 brick.pose.position.z = 0.0
 
             brick.pose.orientation = self.get_quaternion_from_yaw(angle_rad)
             bricks_msg.bricks.append(brick)
+
+             # -------- Marker --------
+            marker = Marker()
+            marker.header = msg.header
+            marker.ns = "bricks"
+            marker.id = brick_id
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose = brick.pose
+            marker.scale.x = 0.03
+            marker.scale.y = 0.03
+            marker.scale.z = 0.03
+            marker.color.r = 0.8
+            marker.color.g = 0.2
+            marker.color.b = 0.2
+            marker.color.a = 0.8
+            marker.lifetime.nanosec = int(0.2 * 1e9)
+
+            marker_array.markers.append(marker)
 
             ros_det = Detection2D()
             ros_det.header = msg.header
@@ -252,7 +363,7 @@ class YoloV8Detector(Node):
             hyp.hypothesis.score = det['conf']
             ros_det.results.append(hyp)
             dets_msg.detections.append(ros_det)
-
+        
             color = (0, 255, 0)
             if side_str == "GRID": color = (0, 255, 255) 
             elif side_str == "ABB": color = (255, 0, 0) 
@@ -284,7 +395,9 @@ class YoloV8Detector(Node):
         self.dets_pub.publish(dets_msg)
         self.last_bricks_detected = bricks_msg
         self.bricks_pub.publish(bricks_msg)
-        
+        self.marker_pub.publish(marker_array)
+
+
         out_img_msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding='bgr8')
         out_img_msg.header = msg.header
         self.image_pub.publish(out_img_msg)
