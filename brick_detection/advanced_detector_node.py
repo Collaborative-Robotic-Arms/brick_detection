@@ -38,7 +38,7 @@ class YoloV8Detector(Node):
         # --- Parameters ---
         default_model_path = os.path.join(
             os.path.expanduser('~'),
-            'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'best_final.pt'
+            'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'last.pt'
         )
         self.declare_parameter('model_path', default_model_path)
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
@@ -279,7 +279,7 @@ class YoloV8Detector(Node):
 
         marker_array = MarkerArray()
         annotated_frame = frame.copy()
-
+        
         for det in tracked_detections:
             brick_id = det['id']
             name = det['type']
@@ -318,9 +318,9 @@ class YoloV8Detector(Node):
                 brick.pose.position.y = (cy - self.intrinsics['cy']) * self.static_z / self.intrinsics['fy']
                 brick.pose.position.z = float(self.static_z)
 
-                brick.pose.position.x = brick.pose.position.x - 0.0546
-                brick.pose.position.y = brick.pose.position.y + 0.674
-                brick.pose.position.z = 0.769-brick.pose.position.z
+                # brick.pose.position.x = brick.pose.position.x - 0.0546
+                # brick.pose.position.y = brick.pose.position.y + 0.674
+                # brick.pose.position.z = 0.769-brick.pose.position.z
             else:
                 # Fallback to original pixel-offset logic if intrinsics are missing
                 brick.pose.position.x = float(cx - W/2)

@@ -29,6 +29,7 @@ setup(
         'advanced_yolo = brick_detection.advanced_detector_node:main',
         'simulation_detector = brick_detection.simulation_detector_node:main',
         'sim_yolo = brick_detection.sim_detector:main',
+        'final_detector = brick_detection.orientation_detector_node:main',
         ],
     },
 )
