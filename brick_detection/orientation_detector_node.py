@@ -28,7 +28,7 @@ class YoloV8Detector(Node):
         # --- Parameters ---
         default_model_path = os.path.join(
             os.path.expanduser('~'),
-            'gp_ws', 'src', 'detection_grasping','brick_detection','weights', 'last.pt'
+            'collab_ws', 'src', 'detection_grasping','brick_detection','weights', 'last.pt'
         )
         self.declare_parameter('model_path', default_model_path)
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
@@ -120,7 +120,19 @@ class YoloV8Detector(Node):
 
         frame = cv2.remap(raw_frame, self.map1, self.map2, cv2.INTER_LINEAR)
         H, W, _ = frame.shape
+        split_y = int(0.42 * H)
         
+        grid_size_cm = 24.0
+        grid_size_px = int(grid_size_cm * self.px_per_cm)
+        
+        grid_center_x = int((W / 2) + 56) 
+        grid_center_y = split_y
+        
+        grid_x1 = int(grid_center_x - grid_size_px / 2)
+        grid_y1 = int(grid_center_y - grid_size_px / 2)
+        grid_x2 = int(grid_center_x + grid_size_px / 2)
+        grid_y2 = int(grid_center_y + grid_size_px / 2)
+
         results = self.model(frame, verbose=False, retina_masks=True)[0]
         current_frame_data = []
 
@@ -199,6 +211,18 @@ class YoloV8Detector(Node):
             ros_det.results.append(hyp)
             dets_msg.detections.append(ros_det)
 
+            assigned_side = 0
+            side_str = ""
+            in_grid = (grid_x1 < cx < grid_x2) and (grid_y1 < cy < grid_y2)
+            if in_grid:
+                assigned_side = Brick.GRID
+                side_str = "GRID"
+            elif cy < split_y:
+                assigned_side = Brick.ABB
+                side_str = "ABB"
+            else:
+                assigned_side = Brick.AR4
+                side_str = "AR4"
             # 5. Build Brick Message & Markers
             brick = Brick()
             brick.id = int(brick_id)
@@ -206,7 +230,7 @@ class YoloV8Detector(Node):
             brick.pose.position.x = (cx - self.intrinsics['cx']) * self.static_z / self.intrinsics['fx']
             brick.pose.position.y = (cy - self.intrinsics['cy']) * self.static_z / self.intrinsics['fy']
             brick.pose.position.z = float(self.static_z)
-
+            brick.side = assigned_side
             # angle_rad -= math.pi/ 2
             self.get_logger().info(f"Angle Degree: {math.degrees(angle_rad)}")
             brick.pose.orientation = self.get_quaternion_from_yaw(angle_rad)
@@ -220,7 +244,20 @@ class YoloV8Detector(Node):
             marker.scale.x, marker.scale.y, marker.scale.z = 0.03, 0.03, 0.03
             marker.color.r, marker.color.a = 0.8, 0.8
             marker_array.markers.append(marker)
+        
+        overlay = annotated_frame.copy()
+        cv2.line(overlay, (0, split_y), (W, split_y), (255, 255, 255), 2)
+        cv2.putText(overlay, "ABB Side", (10, split_y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(overlay, "AR4 Side", (10, split_y + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+        cv2.rectangle(overlay, (grid_x1, grid_y1), (grid_x2, grid_y2), (0, 255, 255), 2)
+        cv2.putText(overlay, "GRID", (grid_x1, grid_y1 - 5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        cv2.addWeighted(overlay, 0.3, annotated_frame, 0.7, 0, annotated_frame)
+        
         # Publish all
         self.dets_pub.publish(dets_msg)
         self.bricks_pub.publish(bricks_msg)
