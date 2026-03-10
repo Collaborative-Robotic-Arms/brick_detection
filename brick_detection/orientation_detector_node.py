@@ -67,42 +67,152 @@ class YoloV8Detector(Node):
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
         self.srv = self.create_service(DetectBricks, 'detect_bricks', self.detect_bricks_callback)
 
-    def get_orientation_min_area(self, poly_points, brick_type, binary_mask=None):
-        if len(poly_points) < 3:
+    def get_orientation_min_area(self, poly_points, brick_type, binary_mask):
+        if len(poly_points) < 3 or binary_mask is None:
             return 0.0, None, (0.0, 0.0)
         
+        # 1. Get the basic geometry
         pts = np.array(poly_points, dtype=np.float32).reshape(-1, 1, 2)
         rect = cv2.minAreaRect(pts)
         (rect_cx, rect_cy), (w, h), angle = rect
         
 
-        M = cv2.moments(pts)
-        if M['m00'] == 0: return 0.0, None, (rect_cx, rect_cy)
-        centroid_x, centroid_y = M['m10']/M['m00'], M['m01']/M['m00']
-        
-        vec_x, vec_y = centroid_x - rect_cx, centroid_y - rect_cy
-        
-        if brick_type == Brick.L_BRICK:
-            angle_rad = math.atan2(vec_y, vec_x)
-        elif brick_type == Brick.I_BRICK:
-            angle_rad = math.radians(angle)
+        # --- I-BRICK SPECIFIC LOGIC ---
+        if brick_type == Brick.I_BRICK:
+            # Determine which side is the long side
+            if w < h:
+                # The 'h' is the length, angle is usually negative from vertical
+                actual_angle = angle + 90 
+            else:
+                # The 'w' is the length, angle is from horizontal
+                actual_angle = angle + 180
+                
+            angle_rad = math.radians(actual_angle)
+            
+            # Symmetrize: For I-bricks, 0 deg and 180 deg are identical.
+            # We force the arrow to always point in the 'positive' half-plane
+            # to prevent 180-degree jitter.
+            angle_rad = math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+            # if angle_rad > math.pi / 2:
+            #     angle_rad -= math.pi
+            # elif angle_rad < -math.pi / 2:
+            #     angle_rad += math.pi
+                
+            box_points = cv2.boxPoints(rect).astype(int)
+            return angle_rad, box_points, (rect_cx, rect_cy)
+        # Standardize the angle based on long/short side
+        if w < h:
+            angle_rad = math.radians(angle + 180) # Vertical-ish
         else:
-            if w < h: angle += 90
-            angle_rad = math.radians(angle)
+            angle_rad = math.radians(angle + 90)  # Horizontal-ish
+        
+       
+        # Ensure angle is in [-pi, pi]
+        angle_rad = math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
-        if binary_mask is not None:
-            check_dist = 15 
-            tail_x = int(rect_cx - check_dist * math.cos(angle_rad))
-            tail_y = int(rect_cy - check_dist * math.sin(angle_rad))
-            h_img, w_img = binary_mask.shape
-            if 0 <= tail_x < w_img and 0 <= tail_y < h_img:
-                if binary_mask[tail_y, tail_x] == 0:
-                    angle_rad += math.pi
+        # I-Bricks are symmetric; we don't care about 180-degree flips
+        # if brick_type == Brick.I_BRICK:
+        #     box_points = cv2.boxPoints(rect).astype(int)
+        #     angle_rad = math.atan2(math.sin(math.radians(angle + 90)), math.cos(math.radians(angle_rad +90)))
+        #     return angle_rad, box_points, (rect_cx, rect_cy)
 
+        
+        # 2. Sampling Strategy for L and T bricks
+        # We check pixel density at +/- 'offset' along the calculated axis
+        h_img, w_img = binary_mask.shape
+        offset = 20  # Pixels to look ahead/behind
+        
+        def get_mask_density(center_x, center_y, ang, dist):
+            # Calculate a point 'dist' away from center at angle 'ang'
+            test_x = int(center_x + dist * math.cos(ang))
+            test_y = int(center_y + dist * math.sin(ang))
+            
+            # Create a small 5x5 window to average density (more robust than 1 pixel)
+            x_start, x_end = max(0, test_x-2), min(w_img, test_x+2)
+            y_start, y_end = max(0, test_y-2), min(h_img, test_y+2)
+            
+            region = binary_mask[y_start:y_end, x_start:x_end]
+            return np.sum(region) if region.size > 0 else 0
+
+        # Sample both ends
+        density_front = get_mask_density(rect_cx, rect_cy, angle_rad, offset)
+        density_back = get_mask_density(rect_cx, rect_cy, angle_rad, -offset)
+        def get_mask_density(cx, cy, ang, dist, mask):
+            """
+            Calculates the average pixel intensity in a small region 
+            at a specific distance and angle from a center point.
+            """
+            h_img, w_img = mask.shape
+            
+            # 1. Calculate the coordinates of the 'probe' point
+            # Using polar-to-cartesian conversion: x = r*cos(theta), y = r*sin(theta)
+            tx = int(cx + dist * math.cos(ang))
+            ty = int(cy + dist * math.sin(ang))
+            
+            # 2. Define a small 5x5 window (kernel) around that point
+            # We use max/min to ensure we don't look outside the image boundaries
+            x1, x2 = max(0, tx - 2), min(w_img, tx + 2)
+            y1, y2 = max(0, ty - 2), min(h_img, ty + 2)
+            
+            # 3. Extract the region from the binary mask
+            region = mask[y1:y2, x1:x2]
+            
+            # 4. Return the density (0.0 to 1.0)
+            # np.mean on a binary mask (0s and 1s) returns the percentage of 'filled' pixels
+            return np.mean(region) if region.size > 0 else 0
+        if brick_type == Brick.L_BRICK:
+            if w < h:
+                base_angle = math.radians(angle + 180)
+            else:
+                base_angle = math.radians(angle + 90)
+
+            corner_candidates = [
+                base_angle + math.pi/4,    # 45 deg
+                base_angle + 3*math.pi/4,  # 135 deg
+                base_angle + 5*math.pi/4,  # 225 deg
+                base_angle + 7*math.pi/4   # 315 deg
+            ]
+
+            # Scoring: We want the corner with the LEAST total plastic 
+            # across two different radii (Inner and Outer)
+            best_score = 999 # Higher than max possible (2.0)
+            best_angle = base_angle
+            self.debug_pts = [] # Store points for visualization
+            for cand_angle in corner_candidates:
+                # Inner check: 15 pixels (Near the center, should be plastic if not the gap)
+                # Outer check: 28 pixels (In the middle of the 1x1 block area)
+                
+
+                r_inner, r_outer = 15, 28
+                
+                d1 = get_mask_density(rect_cx, rect_cy, cand_angle, r_inner, binary_mask)
+                d2 = get_mask_density(rect_cx, rect_cy, cand_angle, r_outer, binary_mask)
+                total_density = d1 + d2
+                # Store points for drawing (x, y, density_value)
+                p1 = (int(rect_cx + r_inner * math.cos(cand_angle)), int(rect_cy + r_inner * math.sin(cand_angle)))
+                p2 = (int(rect_cx + r_outer * math.cos(cand_angle)), int(rect_cy + r_outer * math.sin(cand_angle)))
+                self.debug_pts.append((p1, d1))
+                self.debug_pts.append((p2, d2))
+
+                
+                if total_density < best_score:
+                    best_score = total_density
+                    best_angle = cand_angle
+            
+            angle_rad = math.atan2(math.sin(best_angle), math.cos(best_angle))
+                
+        elif brick_type == Brick.T_BRICK:
+            # T-Brick: Point arrow toward the TAIL
+            # The tail usually has higher density at the end of the long axis 
+            # (depending on how your model defines the rectangle)
+            if density_back > density_front:
+                angle_rad += math.pi
+
+        # Clean up angle and get box
         angle_rad = math.atan2(math.sin(angle_rad), math.cos(angle_rad))
         box_points = cv2.boxPoints(rect).astype(int)
-        return angle_rad, box_points, (centroid_x, centroid_y)
-
+        
+        return angle_rad, box_points, (rect_cx, rect_cy)
     def get_quaternion_from_yaw(self, yaw):
         return Quaternion(x=0.0, y=0.0, z=math.sin(yaw/2.0), w=math.cos(yaw/2.0))
 
@@ -172,7 +282,8 @@ class YoloV8Detector(Node):
         
         marker_array = MarkerArray()
         annotated_frame = frame.copy()
-    
+
+        
         for det in tracked_detections:
             cx, cy = det['center']
             centroid_x, centroid_y = det['centroid']
@@ -180,6 +291,18 @@ class YoloV8Detector(Node):
             x1_box, y1_box, x2_box, y2_box = map(int, det['box'])
             brick_id = det['id']
             name = det['type']
+
+            ### Uncomment for debugging only
+            # self.get_logger().info(f"name:{name}")
+            # if str(name) == "L":
+            #     for pt, density in self.debug_pts:
+            #         # Color logic: Green if it detects plastic (high density), Red if empty (low density)
+            #         color = (0, 255, 0) if density > 0.5 else (0, 0, 255)
+            #         cv2.circle(annotated_frame, pt, 3, color, -1)
+                    
+            #         # Optional: Draw faint circles showing the scan rings
+            #         cv2.circle(annotated_frame, (int(centroid_x), int(centroid_y)), 15, (100, 100, 100), 1)
+            #         cv2.circle(annotated_frame, (int(centroid_x), int(centroid_y)), 28, (100, 100, 100), 1)
 
             # 1. Draw Centroid (Magenta) and Offset line
             cv2.circle(annotated_frame, (int(centroid_x), int(centroid_y)), 5, (255, 0, 255), -1)
@@ -232,7 +355,7 @@ class YoloV8Detector(Node):
             brick.pose.position.z = float(self.static_z)
             brick.side = assigned_side
             # angle_rad -= math.pi/ 2
-            self.get_logger().info(f"Angle Degree: {math.degrees(angle_rad)}")
+            # self.get_logger().info(f"Angle Degree: {math.degrees(angle_rad)}")
             brick.pose.orientation = self.get_quaternion_from_yaw(angle_rad)
             bricks_msg.bricks.append(brick)
 
