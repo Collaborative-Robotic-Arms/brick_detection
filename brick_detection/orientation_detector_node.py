@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 import cv2
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 from geometry_msgs.msg import Quaternion, Pose
@@ -35,6 +35,11 @@ class YoloV8Detector(Node):
         self.declare_parameter('pixels_per_cm', 8.0) 
         self.declare_parameter('static_z_height', 0.712) 
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+        self.declare_parameter('use_sim', True)
+        self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
+
+        self.use_sim = self.get_parameter('use_sim').value
+        camera_info_topic = self.get_parameter('camera_info_topic').value
 
         model_path = self.get_parameter('model_path').value
         image_topic = self.get_parameter('image_topic').value
@@ -42,15 +47,28 @@ class YoloV8Detector(Node):
         self.static_z = self.get_parameter('static_z_height').value
         self.camera_frame = self.get_parameter('camera_frame').value
 
+        self.camera_info_received = False
+        self.k_matrix = None
+        self.dist_coeffs = None
+        self.map1 = None
+        self.map2 = None
+        self.intrinsics = None
+
         # --- Calibration Data ---
-        self.k_matrix = np.array([[607.649, 0.0, 330.204], [0.0, 605.196, 246.368], [0.0, 0.0, 1.0]])
-        self.dist_coeffs = np.array([0.0307, 0.6603, -0.0030, -0.0053, -2.5473])
+        if not self.use_sim:
+            self.k_matrix = np.array([[607.649, 0.0, 330.204], [0.0, 605.196, 246.368], [0.0, 0.0, 1.0]])
+            self.dist_coeffs = np.array([0.0307, 0.6603, -0.0030, -0.0053, -2.5473])
 
-        self.img_w, self.img_h = 640, 480 
-        new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0)
-        self.map1, self.map2 = cv2.initUndistortRectifyMap(self.k_matrix, self.dist_coeffs, None, new_camera_mtx, (self.img_w, self.img_h), cv2.CV_32FC1)
+            self.img_w, self.img_h = 640, 480 
+            new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0)
+            self.map1, self.map2 = cv2.initUndistortRectifyMap(self.k_matrix, self.dist_coeffs, None, new_camera_mtx, (self.img_w, self.img_h), cv2.CV_32FC1)
 
-        self.intrinsics = {'fx': new_camera_mtx[0,0], 'fy': new_camera_mtx[1,1], 'cx': new_camera_mtx[0,2], 'cy': new_camera_mtx[1,2]}
+            self.intrinsics = {'fx': new_camera_mtx[0,0], 'fy': new_camera_mtx[1,1], 'cx': new_camera_mtx[0,2], 'cy': new_camera_mtx[1,2]}
+            
+            self.camera_info_received = True
+            self.get_logger().info("HARDWARE Calibration Loaded.")
+        else:
+            self.get_logger().info("SIMULATION MODE Active: Waiting for /camera_info...")
 
         self.model = YOLO(model_path)
         self.tracker = BrickTracker(distance_threshold=60, max_disappeared=300)
@@ -62,10 +80,45 @@ class YoloV8Detector(Node):
         self.dets_pub = self.create_publisher(Detection2DArray, '/yolo/detections', 10)
         self.bricks_pub = self.create_publisher(BricksArray, '/detected_bricks', 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/yolo/markers', 10)
+        if self.use_sim:
+            self.cam_info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.cam_info_callback, 10)
         
         # Subscribers
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
         self.srv = self.create_service(DetectBricks, 'detect_bricks', self.detect_bricks_callback)
+
+    def cam_info_callback(self, msg: CameraInfo):
+        if self.camera_info_received:
+            return
+
+        self.k_matrix = np.array(msg.k).reshape((3, 3))
+        self.dist_coeffs = np.array(msg.d) if len(msg.d) > 0 else np.zeros(5)
+        self.img_w = msg.width
+        self.img_h = msg.height
+
+        if self.use_sim:
+            self.intrinsics = {
+                'fx': self.k_matrix[0, 0], 'fy': self.k_matrix[1, 1],
+                'cx': self.k_matrix[0, 2], 'cy': self.k_matrix[1, 2]
+            }
+            self.map1 = None
+            self.map2 = None
+            self.camera_info_received = True
+        else:
+            self.dist_coeffs = np.array(msg.d) if len(msg.d) > 0 else np.zeros(5)
+            new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(
+                self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0, (self.img_w, self.img_h)
+            )
+            self.map1, self.map2 = cv2.initUndistortRectifyMap(
+                self.k_matrix, self.dist_coeffs, None, new_camera_mtx, 
+                (self.img_w, self.img_h), cv2.CV_32FC1
+            )
+            self.intrinsics = {
+                'fx': new_camera_mtx[0, 0], 'fy': new_camera_mtx[1, 1],
+                'cx': new_camera_mtx[0, 2], 'cy': new_camera_mtx[1, 2]
+            }
+            self.camera_info_received = True
+            self.get_logger().info("SIMULATION Calibration Loaded from /camera_info.")
 
     def get_orientation_min_area(self, poly_points, brick_type, binary_mask):
         if len(poly_points) < 3 or binary_mask is None:
@@ -224,24 +277,42 @@ class YoloV8Detector(Node):
         return 255
 
     def image_callback(self, msg: Image):
+        if not self.camera_info_received:
+            return
         try:
             raw_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception: return
 
-        frame = cv2.remap(raw_frame, self.map1, self.map2, cv2.INTER_LINEAR)
+        if self.use_sim or self.map1 is None:
+            frame = raw_frame.copy()
+        else:
+            frame = cv2.remap(raw_frame, self.map1, self.map2, cv2.INTER_LINEAR)
         H, W, _ = frame.shape
         split_y = int(0.42 * H)
         
-        grid_size_cm = 24.0
-        grid_size_px = int(grid_size_cm * self.px_per_cm)
-        
-        grid_center_x = int((W / 2) + 56) 
-        grid_center_y = split_y
-        
-        grid_x1 = int(grid_center_x - grid_size_px / 2)
-        grid_y1 = int(grid_center_y - grid_size_px / 2)
-        grid_x2 = int(grid_center_x + grid_size_px / 2)
-        grid_y2 = int(grid_center_y + grid_size_px / 2)
+        if self.use_sim:
+            # SIMULATION: Centered exactly at camera center
+            grid_center_x = int(W / 2)-8
+            grid_center_y = int(H / 2)-40
+            
+            # SIMULATION SCALING: Math projection based on exact table height (static_z)
+            # Formula: Pixels = (Real_Size_Meters * Focal_Length) / Depth_Meters
+            grid_size_meters = 0.24
+            grid_w_px = int((grid_size_meters * self.intrinsics['fx']) / 0.735)
+            grid_h_px = int((grid_size_meters * self.intrinsics['fy']) / 0.735)
+        else:
+            # HARDWARE: Original manual calibration and hardcoded ratio
+            grid_center_x = int((W / 2) + 56) 
+            grid_center_y = split_y
+            
+            grid_size_cm = 24.0
+            grid_w_px = int(grid_size_cm * self.px_per_cm)
+            grid_h_px = int(grid_size_cm * self.px_per_cm)
+
+        grid_x1 = int(grid_center_x - grid_w_px / 2)
+        grid_y1 = int(grid_center_y - grid_h_px / 2)
+        grid_x2 = int(grid_center_x + grid_w_px / 2)
+        grid_y2 = int(grid_center_y + grid_h_px / 2)
 
         results = self.model(frame, verbose=False, retina_masks=True)[0]
         current_frame_data = []
