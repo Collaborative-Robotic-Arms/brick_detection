@@ -35,7 +35,7 @@ class YoloV8Detector(Node):
         self.declare_parameter('pixels_per_cm', 8.0) 
         self.declare_parameter('static_z_height', 0.712) 
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
-        self.declare_parameter('use_sim', True)
+        self.declare_parameter('use_sim', False)
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
 
         self.use_sim = self.get_parameter('use_sim').value
@@ -54,21 +54,22 @@ class YoloV8Detector(Node):
         self.map2 = None
         self.intrinsics = None
 
+
         # --- Calibration Data ---
-        if not self.use_sim:
-            self.k_matrix = np.array([[607.649, 0.0, 330.204], [0.0, 605.196, 246.368], [0.0, 0.0, 1.0]])
-            self.dist_coeffs = np.array([0.0307, 0.6603, -0.0030, -0.0053, -2.5473])
+        # if not self.use_sim:
+        #     self.k_matrix = np.array([[607.649, 0.0, 330.204], [0.0, 605.196, 246.368], [0.0, 0.0, 1.0]])
+        #     self.dist_coeffs = np.array([0.0307, 0.6603, -0.0030, -0.0053, -2.5473])
 
-            self.img_w, self.img_h = 640, 480 
-            new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0)
-            self.map1, self.map2 = cv2.initUndistortRectifyMap(self.k_matrix, self.dist_coeffs, None, new_camera_mtx, (self.img_w, self.img_h), cv2.CV_32FC1)
+        #     self.img_w, self.img_h = 640, 480 
+        #     new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0)
+        #     self.map1, self.map2 = cv2.initUndistortRectifyMap(self.k_matrix, self.dist_coeffs, None, new_camera_mtx, (self.img_w, self.img_h), cv2.CV_32FC1)
 
-            self.intrinsics = {'fx': new_camera_mtx[0,0], 'fy': new_camera_mtx[1,1], 'cx': new_camera_mtx[0,2], 'cy': new_camera_mtx[1,2]}
+        #     self.intrinsics = {'fx': new_camera_mtx[0,0], 'fy': new_camera_mtx[1,1], 'cx': new_camera_mtx[0,2], 'cy': new_camera_mtx[1,2]}
             
-            self.camera_info_received = True
-            self.get_logger().info("HARDWARE Calibration Loaded.")
-        else:
-            self.get_logger().info("SIMULATION MODE Active: Waiting for /camera_info...")
+        #     self.camera_info_received = True
+        #     self.get_logger().info("HARDWARE Calibration Loaded.")
+        # else:
+        #     self.get_logger().info("SIMULATION MODE Active: Waiting for /camera_info...")
 
         self.model = YOLO(model_path)
         self.tracker = BrickTracker(distance_threshold=60, max_disappeared=300)
@@ -80,34 +81,26 @@ class YoloV8Detector(Node):
         self.dets_pub = self.create_publisher(Detection2DArray, '/yolo/detections', 10)
         self.bricks_pub = self.create_publisher(BricksArray, '/detected_bricks', 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/yolo/markers', 10)
-        if self.use_sim:
-            self.cam_info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.cam_info_callback, 10)
+        self.cam_info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.cam_info_callback, 10)
         
         # Subscribers
         self.image_sub = self.create_subscription(Image, image_topic, self.image_callback, 10)
         self.srv = self.create_service(DetectBricks, 'detect_bricks', self.detect_bricks_callback)
 
     def cam_info_callback(self, msg: CameraInfo):
+        # Only process once to save resources, or every time if you expect changes
         if self.camera_info_received:
             return
 
-        self.k_matrix = np.array(msg.k).reshape((3, 3))
-        self.dist_coeffs = np.array(msg.d) if len(msg.d) > 0 else np.zeros(5)
         self.img_w = msg.width
         self.img_h = msg.height
+        self.k_matrix = np.array(msg.k).reshape((3, 3))
+        self.dist_coeffs = np.array(msg.d) if len(msg.d) > 0 else np.zeros(5)
 
-        if self.use_sim:
-            self.intrinsics = {
-                'fx': self.k_matrix[0, 0], 'fy': self.k_matrix[1, 1],
-                'cx': self.k_matrix[0, 2], 'cy': self.k_matrix[1, 2]
-            }
-            self.map1 = None
-            self.map2 = None
-            self.camera_info_received = True
-        else:
-            self.dist_coeffs = np.array(msg.d) if len(msg.d) > 0 else np.zeros(5)
+        # Check if we actually need to undistort (if dist_coeffs are non-zero)
+        if np.any(self.dist_coeffs):
             new_camera_mtx, _ = cv2.getOptimalNewCameraMatrix(
-                self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0, (self.img_w, self.img_h)
+                self.k_matrix, self.dist_coeffs, (self.img_w, self.img_h), 0
             )
             self.map1, self.map2 = cv2.initUndistortRectifyMap(
                 self.k_matrix, self.dist_coeffs, None, new_camera_mtx, 
@@ -117,8 +110,16 @@ class YoloV8Detector(Node):
                 'fx': new_camera_mtx[0, 0], 'fy': new_camera_mtx[1, 1],
                 'cx': new_camera_mtx[0, 2], 'cy': new_camera_mtx[1, 2]
             }
-            self.camera_info_received = True
-            self.get_logger().info("SIMULATION Calibration Loaded from /camera_info.")
+        else:
+            # No distortion (likely simulation)
+            self.intrinsics = {
+                'fx': self.k_matrix[0, 0], 'fy': self.k_matrix[1, 1],
+                'cx': self.k_matrix[0, 2], 'cy': self.k_matrix[1, 2]
+            }
+            self.map1, self.map2 = None, None
+
+        self.camera_info_received = True
+        self.get_logger().info(f"Calibration loaded dynamically from {msg.header.frame_id}")
 
     def get_orientation_min_area(self, poly_points, brick_type, binary_mask):
         if len(poly_points) < 3 or binary_mask is None:
@@ -302,8 +303,8 @@ class YoloV8Detector(Node):
             grid_h_px = int((grid_size_meters * self.intrinsics['fy']) / 0.735)
         else:
             # HARDWARE: Original manual calibration and hardcoded ratio
-            grid_center_x = int((W / 2) + 56) 
-            grid_center_y = split_y
+            grid_center_x = int((W / 2) - 12) 
+            grid_center_y = int((H / 2) - 35)
             
             grid_size_cm = 24.0
             grid_w_px = int(grid_size_cm * self.px_per_cm)
